@@ -1,0 +1,9 @@
+mujoco>=2.3.3
+numpy>=1.21.0
+matplotlib>=3.5.0
+pyyaml>=6.0
+tensorflow>=2.10.0
+optuna>=3.0.0
+gymnasium>=0.28.0
+robot-descriptions>=1.0.0
+imageio
