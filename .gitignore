@@ -57,8 +57,8 @@ nosetests.xml
 .ruff_cache/
 
 ## Logs and runtime files
-*.log
 logs/
+*.log
 MUJOCO_LOG.TXT
 
 ## Project outputs / large files
@@ -66,7 +66,7 @@ results/
 *.npz
 visualizer_recording_*.npz
 
-## Misc
+## Misc temporary files
 *.swp
 *.swo
 *.bak
@@ -75,9 +75,14 @@ visualizer_recording_*.npz
 # Secrets / environment
 .env
 .env.*
-.pytest_cache
-.venv
-venv
-__pycache__
-*.pyc
+
+## Local agent metadata
 .codex
+
+## Repeated/covered patterns (kept for clarity)
+# pytest cache and python virtualenvs are covered above but listed explicitly for readability
+.pytest_cache/
+.venv/
+venv/
+__pycache__/
+*.pyc

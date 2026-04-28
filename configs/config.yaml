@@ -1,14 +1,18 @@
+robot:
+  name: panda_mj_description
+  variant: scene
+
 controller:
-  type: rl  # pd | rl | nn_pd
+  type: pd  # pd | rl | nn_pd
   params:
     kp: 150.0
     kd: 20.0
 
 trajectory:
-  type: neural  # classic | neural
+  type: classic  # classic | neural
   params:
     amplitude: 1.0
     frequency: 0.5
 
 simulation:
-  duration: 200
+  duration: 20

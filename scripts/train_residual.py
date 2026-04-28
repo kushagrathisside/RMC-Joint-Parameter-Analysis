@@ -7,13 +7,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import numpy as np
+from controllers.pd_controller import PDController
 from utils.learning_utils import (
     DEFAULT_RANDOM_SEED,
     DATASET_PATH,
+    DEFAULT_RESIDUAL_SCALE,
     DEFAULT_VALIDATION_SPLIT,
-    PPO_POLICY_MODEL_PATH,
-    PPO_METRICS_PATH,
-    PPO_POLICY_STATS_PATH,
+    RESIDUAL_MODEL_PATH,
+    RESIDUAL_METRICS_PATH,
+    RESIDUAL_STATS_PATH,
     ensure_results_dir,
     load_dataset,
     normalize_states,
@@ -24,8 +26,11 @@ from utils.learning_utils import (
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train a reward-weighted PPO-style actor from a logged dataset.")
+    parser = argparse.ArgumentParser(description="Train a residual model on top of the PD controller.")
     parser.add_argument("--dataset", default=str(DATASET_PATH), help="Path to the dataset NPZ file.")
+    parser.add_argument("--kp", type=float, default=150.0, help="PD proportional gain.")
+    parser.add_argument("--kd", type=float, default=20.0, help="PD derivative gain.")
+    parser.add_argument("--residual-scale", type=float, default=DEFAULT_RESIDUAL_SCALE, help="Residual scaling factor.")
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=256, help="Mini-batch size.")
     parser.add_argument("--learning-rate", type=float, default=1e-3, help="Adam learning rate.")
@@ -36,120 +41,103 @@ def parse_args():
         help="Fraction of samples reserved for validation. Set to 0 to disable.",
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_RANDOM_SEED, help="Random seed for splitting/shuffling.")
-    parser.add_argument(
-        "--output-model",
-        default=str(PPO_POLICY_MODEL_PATH),
-        help="Path to save the PPO-style actor model.",
-    )
+    parser.add_argument("--output-model", default=str(RESIDUAL_MODEL_PATH), help="Path to save the residual model.")
     parser.add_argument(
         "--output-stats",
-        default=str(PPO_POLICY_STATS_PATH),
-        help="Path to save normalization statistics.",
+        default=str(RESIDUAL_STATS_PATH),
+        help="Path to save normalization and gain metadata.",
     )
     parser.add_argument(
         "--metrics-output",
-        default=str(PPO_METRICS_PATH),
+        default=str(RESIDUAL_METRICS_PATH),
         help="Path to save training metrics as JSON.",
     )
     return parser.parse_args()
 
 
-def build_reward_weights(rewards):
-    rewards = np.asarray(rewards, dtype=np.float32)
-    reward_weights = rewards - rewards.min() + 1e-3
-    reward_weights = reward_weights / max(float(reward_weights.mean()), 1e-6)
-    return reward_weights.astype(np.float32)
-
-
-def evaluate_loss(agent, states, actions, reward_weights):
+def evaluate_loss(agent, states, residual_targets):
     if len(states) == 0:
         return None
     import tensorflow as tf
 
     state_tensor = tf.convert_to_tensor(states, dtype=tf.float32)
-    action_tensor = tf.convert_to_tensor(actions, dtype=tf.float32)
-    weight_tensor = tf.convert_to_tensor(reward_weights, dtype=tf.float32)
-    action_targets = tf.clip_by_value(action_tensor / agent.action_scale, -1.0, 1.0)
-    predictions = agent.actor(state_tensor, training=False)
-    squared_error = tf.reduce_mean(tf.square(predictions - action_targets), axis=1)
-    return float(tf.reduce_mean(weight_tensor * squared_error).numpy())
+    target_tensor = tf.convert_to_tensor(residual_targets, dtype=tf.float32)
+    scaled_targets = tf.clip_by_value(target_tensor / agent.residual_scale, -1.0, 1.0)
+    predictions = agent.nn(state_tensor, training=False)
+    return float(tf.reduce_mean(tf.square(predictions - scaled_targets)).numpy())
 
 
 def train(
     dataset_path=DATASET_PATH,
+    kp=150.0,
+    kd=20.0,
+    residual_scale=DEFAULT_RESIDUAL_SCALE,
     epochs=50,
     batch_size=256,
     learning_rate=1e-3,
     validation_split=DEFAULT_VALIDATION_SPLIT,
     seed=DEFAULT_RANDOM_SEED,
-    model_path=PPO_POLICY_MODEL_PATH,
-    stats_path=PPO_POLICY_STATS_PATH,
-    metrics_path=PPO_METRICS_PATH,
+    model_path=RESIDUAL_MODEL_PATH,
+    stats_path=RESIDUAL_STATS_PATH,
+    metrics_path=RESIDUAL_METRICS_PATH,
 ):
     import tensorflow as tf
 
-    from controllers.rl_controller import RLController
+    from controllers.nn_compensated_pd import NNCompensatedPD
 
     dataset = load_dataset(dataset_path)
     states = np.asarray(dataset["state"], dtype=np.float32)
     actions = np.asarray(dataset["action"], dtype=np.float32)
-    rewards = np.asarray(dataset["reward"], dtype=np.float32)
 
-    (train_states, train_actions, train_rewards), (val_states, val_actions, val_rewards) = train_validation_split(
+    (train_states, train_actions), (val_states, val_actions) = train_validation_split(
         states,
         actions,
-        rewards,
         validation_split=validation_split,
         seed=seed,
     )
 
+    pd_controller = PDController(model=None, kp=kp, kd=kd)
+    train_pd_actions = np.stack([pd_controller.compute_from_state(state) for state in train_states], axis=0)
+    val_pd_actions = np.stack([pd_controller.compute_from_state(state) for state in val_states], axis=0)
+    train_residual_targets = train_actions - train_pd_actions
+    val_residual_targets = val_actions - val_pd_actions
+
     normalized_train_states, mean, std = normalize_states(train_states)
     normalized_val_states, _, _ = normalize_states(val_states, mean=mean, std=std)
-    train_reward_weights = build_reward_weights(train_rewards)
-    val_reward_weights = build_reward_weights(val_rewards) if len(val_rewards) else np.asarray([], dtype=np.float32)
     train_state_tensor = tf.convert_to_tensor(normalized_train_states, dtype=tf.float32)
-    train_action_tensor = tf.convert_to_tensor(train_actions, dtype=tf.float32)
-    train_weight_tensor = tf.convert_to_tensor(train_reward_weights, dtype=tf.float32)
+    train_residual_tensor = tf.convert_to_tensor(train_residual_targets, dtype=tf.float32)
 
-    agent = RLController(
+    agent = NNCompensatedPD(
         model=None,
+        kp=kp,
+        kd=kd,
+        residual_scale=residual_scale,
         load_pretrained=False,
-        model_candidates=[(model_path, stats_path)],
     )
     agent.optimizer = tf.keras.optimizers.Adam(learning_rate)
 
-    train_dataset = tf.data.Dataset.from_tensor_slices(
-        (train_state_tensor, train_action_tensor, train_weight_tensor)
-    )
+    train_dataset = tf.data.Dataset.from_tensor_slices((train_state_tensor, train_residual_tensor))
     train_dataset = train_dataset.shuffle(buffer_size=len(train_states), seed=seed).batch(batch_size)
 
     print(
-        f"Training minimal PPO-style actor on {len(train_states)} transitions"
+        f"Training residual policy on {len(train_states)} transitions"
         + (f" with {len(val_states)} validation samples" if len(val_states) else "")
     )
     history = []
-    best_weights = agent.actor.get_weights()
+    best_weights = agent.nn.get_weights()
     best_epoch = 0
     best_score = None
     for epoch in range(epochs):
         losses = []
-        for batch_states, batch_actions, batch_weights in train_dataset:
-            action_targets = tf.clip_by_value(batch_actions / agent.action_scale, -1.0, 1.0)
-            with tf.GradientTape() as tape:
-                pred = agent.actor(batch_states, training=True)
-                squared_error = tf.reduce_mean(tf.square(pred - action_targets), axis=1)
-                loss = tf.reduce_mean(batch_weights * squared_error)
-            grads = tape.gradient(loss, agent.actor.trainable_variables)
-            agent.optimizer.apply_gradients(zip(grads, agent.actor.trainable_variables))
-            losses.append(float(loss.numpy()))
-
+        for batch_states, batch_residuals in train_dataset:
+            losses.append(agent.train_step(batch_states, batch_residuals))
         train_loss = float(np.mean(losses))
-        val_loss = evaluate_loss(agent, normalized_val_states, val_actions, val_reward_weights)
+        val_loss = evaluate_loss(agent, normalized_val_states, val_residual_targets)
         score = val_loss if val_loss is not None else train_loss
         if best_score is None or score < best_score:
             best_score = score
             best_epoch = epoch + 1
-            best_weights = agent.actor.get_weights()
+            best_weights = agent.nn.get_weights()
 
         history.append(
             {
@@ -159,14 +147,23 @@ def train(
             }
         )
         if val_loss is None:
-            print(f"PPO Epoch {epoch + 1:03d} | Train Loss: {train_loss:.6f}")
+            print(f"Residual Epoch {epoch + 1:03d} | Train Loss: {train_loss:.6f}")
         else:
-            print(f"PPO Epoch {epoch + 1:03d} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+            print(
+                f"Residual Epoch {epoch + 1:03d} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}"
+            )
 
     ensure_results_dir()
-    agent.actor.set_weights(best_weights)
-    agent.actor.save(model_path)
-    save_normalization(stats_path, mean, std)
+    agent.nn.set_weights(best_weights)
+    agent.nn.save(model_path)
+    save_normalization(
+        stats_path,
+        mean,
+        std,
+        residual_scale=np.array([residual_scale], dtype=np.float32),
+        kp=np.array([kp], dtype=np.float32),
+        kd=np.array([kd], dtype=np.float32),
+    )
     metrics = {
         "dataset_path": str(dataset_path),
         "num_samples": int(len(states)),
@@ -176,6 +173,9 @@ def train(
         "batch_size": int(batch_size),
         "learning_rate": float(learning_rate),
         "validation_split": float(validation_split),
+        "kp": float(kp),
+        "kd": float(kd),
+        "residual_scale": float(residual_scale),
         "best_epoch": int(best_epoch),
         "best_score": float(best_score),
         "history": history,
@@ -184,7 +184,7 @@ def train(
     }
     save_json(metrics_path, metrics)
 
-    print("Saved PPO-style actor artifacts:")
+    print("Saved residual learning artifacts:")
     print(f"  - {model_path}")
     print(f"  - {stats_path}")
     print(f"  - {metrics_path}")
@@ -197,6 +197,9 @@ if __name__ == "__main__":
     args = parse_args()
     train(
         dataset_path=args.dataset,
+        kp=args.kp,
+        kd=args.kd,
+        residual_scale=args.residual_scale,
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
