@@ -10,15 +10,7 @@ This project integrates classical control, imitation learning, residual learning
 It is designed for rapid experimentation, reproducibility, and extensibility in robotics and AI-driven control systems.
 
 ## Visualization Preview
-
-Paste your visualization window screenshot here near the top of the README.
-
-Recommended markdown after you add the image to the repo:
-
-```md
-![Visualization Window](docs/assets/visualization-window.png)
-```
-
+<img width="1854" height="1048" alt="image" src="https://github.com/user-attachments/assets/f049d346-b217-47ff-8676-4b841e774119" />
 ## Quick Start
 
 Use the default safe path first:
